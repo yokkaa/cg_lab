@@ -138,6 +138,13 @@ FogMarchOut MarchFog(float3 camPos, float3 viewDir, float maxDist, float baseY)
 
     float3 sunDir = normalize(gSunDirW);
     float mu = dot(sunDir, viewDir);
+    
+    // Sun color shift: низкое солнце = тёплый закат, высокое = белый день
+    float sunH = saturate(sunDir.y * 0.5f + 0.5f); // 0..1
+    float3 sunDay = float3(1.0f, 1.0f, 1.0f);
+    float3 sunSunset = float3(1.25f, 0.60f, 0.30f);
+    float3 sunColor = lerp(sunSunset, sunDay, sunH);
+
 
     float pr = PhaseRay(mu);
     float pm = PhaseMieHG(mu, saturate(gMieG));

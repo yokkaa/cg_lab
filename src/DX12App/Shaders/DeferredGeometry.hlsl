@@ -5,6 +5,7 @@ Texture2D gNormalMap : register(t1);
 Texture2D gDisplacementMap : register(t2);
 Texture2DArray gShadowMap : register(t3);
 Texture2D gAOMap : register(t4);
+Texture2D gPaintMask : register(t5);
 
 struct VertexIn
 {
@@ -222,6 +223,15 @@ GBufferData OriginalNormalPS(VertexOut pin)
     float4 diffuseAlbedo = float4(0.5f, 0.5f, 0.5f, 1.0f);
     float ao = gAOMap.Sample(gsamAnisotropicClamp, uv).r;
     diffuseAlbedo.rgb *= ao;
+    static const float gTerrainRootSize = 1024.0f; 
+
+    float2 paintUV = float2(pin.PosW.x / gTerrainRootSize + 0.5f,
+                        pin.PosW.z / gTerrainRootSize + 0.5f);
+
+    paintUV = saturate(paintUV);
+
+    float mask = gPaintMask.Sample(gsamLinearClamp, paintUV).r;
+    diffuseAlbedo.rgb = lerp(diffuseAlbedo.rgb, float3(1, 0, 0), mask);
 
     pout.diffuse = diffuseAlbedo;
     pout.zwzanashih_RGBA32F = float4(0.f, 0.f, 0.f, pin.PosH.z);
@@ -231,6 +241,8 @@ GBufferData OriginalNormalPS(VertexOut pin)
 
     return pout;
 }
+
+static const float gTerrainRootSize = 1024.0f; 
 
 GBufferData DeferredPS(VertexOut pin)
 {
@@ -261,8 +273,17 @@ GBufferData DeferredPS(VertexOut pin)
     float4 diffuseAlbedo = float4(0.5f, 0.5f, 0.5f, 1.0f);
     float ao = gAOMap.Sample(gsamAnisotropicClamp, uv).r;
     diffuseAlbedo.rgb *= ao;
+    static const float gTerrainRootSize = 1024.0f;
+    float2 paintUV = float2(pin.PosW.x / gTerrainRootSize + 0.5f,
+                        pin.PosW.z / gTerrainRootSize + 0.5f);
+    
+    paintUV.y = 1.0f - paintUV.y;
 
+    paintUV = saturate(paintUV);
 
+    float mask = gPaintMask.Sample(gsamLinearClamp, paintUV).r;
+    diffuseAlbedo.rgb = lerp(diffuseAlbedo.rgb, float3(1, 0, 0), mask);
+    
     pout.diffuse = diffuseAlbedo;
     pout.zwzanashih_RGBA32F = float4(0.f, 0.f, 0.f, pin.PosH.z);
     pout.normal = float4(normalMap, Metallic);

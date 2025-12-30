@@ -73,20 +73,16 @@ VertexOut VS(VertexIn vin)
 {
     VertexOut vout;
 
-    // Local vertex position as direction vector.
-    vout.PosL = vin.PosL;
+    float3 lookup = mul((float3x3) gTexTransform, vin.PosL);
+    vout.PosL = lookup;
 
-    // Transform to world space.
     float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
-
-    // Always center sky about camera.
     posW.xyz += gEyePosW;
-
-    // Put skydome at far plane.
     vout.PosH = mul(posW, gViewProj).xyww;
 
     return vout;
 }
+
 
 //Phase functions
 float PhaseRayleigh(float cosTheta)

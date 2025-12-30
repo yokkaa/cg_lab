@@ -93,6 +93,18 @@ struct LightObject
 	ShadowMap* shadowMap;
 };
 
+struct PaintParamsCB
+{
+	DirectX::XMFLOAT2 CenterUV = { -1.0f, -1.0f }; 
+	float RadiusPx = 20.0f;                     
+	float Strength = 0.35f;                      
+
+	DirectX::XMFLOAT2 TexSize = { 1024.0f, 1024.0f }; 
+	float pad0 = 0.0f;
+	float pad1 = 0.0f;
+};
+
+
 class DX12App : public D3DApp
 {
 public:
@@ -140,7 +152,15 @@ private:
 	void DrawDeferredLights();
 	void DrawSkyBox();
 	void DrawPostProcess();
+	void BuildPaintMask();
+	void BuildPickBuffer();
+	void BuildPickCompute();
+	void BuildPaintCompute();
+	void ExecutePaintStrokes();
+	bool PickTerrainUV(int sx, int sy, float& outU, float& outV);
 	void DrawShadowMaps();
+	void UpdateSkyBoxRotation();
+
 
 	// Quad Tree for Terrain
 	Node* BuildNode(int layer, float x, float y, int xi, int yi);
@@ -184,6 +204,9 @@ private:
 
 	Camera mCamera;
 	POINT mLastMousePos;
+	RenderItem* mSkyRitem = nullptr; 
+	DirectX::XMFLOAT3 mSkySunRefDir = { 0.0f, 0.0f, 1.0f };
+	float mSkyRoll = 0.0f;
 
 	UINT mShadowMapHeapIndex = 0;
 
@@ -200,6 +223,58 @@ private:
 	float mRayleighStrength = 1.0f; // multiplies BetaRayleigh
 	float mAtmoExposure = 1.0f;
 	bool  mAtmoEnabled = true;
+
+	// --- Sun animation (for sunrise/sunset) ---
+	float mSunAngle = 0.35f;  
+	float mSunAzimuth = 0.25f; 
+	bool  mSunAuto = false;    
+	float mSunSpeed = 0.15f;     
+
+	// --- Paint mask (GPU) ---
+	static const UINT PaintW = 1024;
+	static const UINT PaintH = 1024;
+
+	ComPtr<ID3D12Resource> mPaintMask = nullptr;
+
+	UINT mPaintMaskSrvIndex = 0;
+	UINT mPaintMaskUavIndex = 0;
+
+	ComPtr<ID3D12RootSignature> mPaintRootSig = nullptr;
+	ComPtr<ID3D12PipelineState> mPaintPSO = nullptr;
+
+	struct PaintStroke
+	{
+		int sx = 0, sy = 0;
+		float radius = 30.0f;
+		float strength = 0.35f;
+	};
+
+	std::vector<PaintStroke> mPendingStrokes;
+
+	std::unique_ptr<UploadBuffer<PaintStroke>> mPaintCB = nullptr;
+	std::unique_ptr<UploadBuffer<PaintParamsCB>> mPaintParamsCB;
+	PaintParamsCB mPaintParamsData;
+
+	// --- Pick (GPU) ---
+	ComPtr<ID3D12Resource> mPickBuffer = nullptr;
+	UINT mPickSrvIndex = 0;
+	UINT mPickUavIndex = 0;
+
+	ComPtr<ID3D12RootSignature> mPickRootSig = nullptr;
+	ComPtr<ID3D12PipelineState> mPickPSO = nullptr;
+
+	struct PickParamsCB
+	{
+		UINT sx = 0, sy = 0;
+		DirectX::XMFLOAT2 ScreenSize = { 1,1 };
+		DirectX::XMFLOAT4X4 InvViewProj = MathHelper::Identity4x4();
+		float RootSize = 1024.f;
+		float pad[3] = { 0,0,0 };
+	};
+
+	std::unique_ptr<UploadBuffer<PickParamsCB>> mPickParamsCB = nullptr;
+
+
 
 };
 
@@ -257,7 +332,18 @@ bool DX12App::Initialize()
 	LoadTerrainTextures();
 	BuildRootSignature();
 	BuildDescriptorHeaps();
+	mPaintMaskSrvIndex = mShadowMapHeapIndex + 32;
+	mPaintMaskUavIndex = mPaintMaskSrvIndex + 1;
+	mPickUavIndex = mPaintMaskUavIndex + 1;
+	mPickSrvIndex = mPickUavIndex + 1;
+	BuildPaintMask();
+	BuildPickBuffer();
+
 	BuildShadersAndInputLayout();
+
+	BuildPaintCompute();
+	BuildPickCompute();
+
 	BuildShapeGeometry();
 	BuildMaterials();
 	BuildRenderItems();
@@ -273,6 +359,9 @@ bool DX12App::Initialize()
 
 	// Wait until initialization is complete.
 	FlushCommandQueue();
+	mPaintParamsCB = std::make_unique<UploadBuffer<PaintParamsCB>>(md3dDevice.Get(), 1, true);
+	mPickParamsCB = std::make_unique<UploadBuffer<PickParamsCB>>(md3dDevice.Get(), 1, true);
+
 
 	return true;
 }
@@ -310,7 +399,7 @@ void DX12App::OnResize()
 	if (mSrvDescriptorHeap != nullptr)
 	{
 		auto srvGBuffer = CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
-		srvGBuffer.Offset(mGBuffer->Channel0SRVHeapIndex, mCbvSrvUavDescriptorSize);
+		srvGBuffer.Offset(mGBuffer->Channel0SRVHeapIndex, mCbvSrvDescriptorSize);
 		md3dDevice->CopyDescriptorsSimple(mGBuffer->NumBuffers, srvGBuffer,
 			mGBuffer->m_SRVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
 			D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -336,12 +425,16 @@ void DX12App::Update(const GameTimer& gt)
 	}
 
 	AnimateMaterials(gt);
-	UpdateObjectCBs(gt);
+
+	UpdateMainPassCB(gt);     
+	UpdateSkyBoxRotation();    
+
+	UpdateObjectCBs(gt);       
 	UpdateVisibleTerrainTiles();
 	UpdateLightCBs(gt);
 	UpdateMaterialCBs(gt);
-	UpdateMainPassCB(gt);
 	UpdatePostProcessCB(gt);
+
 	wchar_t caption[256];
 	swprintf_s(caption, L"Atmosphere: dens=%.2f mie=%.2f ray=%.2f g=%.2f %s  (C=Clean, V=Dirty, T=Toggle)",
 		mAtmoDensity, mMieStrength, mRayleighStrength, mMieG,
@@ -374,13 +467,14 @@ void DX12App::Draw(const GameTimer& gt)
 
 	mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
 	mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-
+	
 	DrawShadowMaps();
 
 	mGBuffer->TransitToOpaqueRenderingState(mCommandList);
 	mGBuffer->ClearRTVs(mCommandList);
 
 	DrawDeferredGeometry();
+	ExecutePaintStrokes();
 
 	mGBuffer->TransitToLightsRenderingState(mCommandList);
 	DrawDeferredLights();
@@ -421,6 +515,18 @@ void DX12App::OnMouseDown(WPARAM btnState, int x, int y)
 	mLastMousePos.y = y;
 
 	SetCapture(mhMainWnd);
+
+	if (btnState & MK_LBUTTON)
+	{
+		PaintStroke s;
+		s.sx = x;
+		s.sy = y;
+		s.radius = 30.0f;
+		s.strength = 0.35f;
+		mPendingStrokes.push_back(s);
+	}
+
+
 }
 
 void DX12App::OnMouseUp(WPARAM btnState, int x, int y)
@@ -473,6 +579,14 @@ void DX12App::OnKeyboardInput(const GameTimer& gt)
 		mCamera.Strafe(mCamera.speed * dt);
 
 	mCamera.UpdateViewMatrix();
+
+	if (mSunAuto)
+	{
+		mSunAngle += mSunSpeed * dt;
+		if (mSunAngle > XM_PIDIV2 - 0.05f) { mSunAngle = XM_PIDIV2 - 0.05f; mSunSpeed = -fabsf(mSunSpeed); }
+		if (mSunAngle < -0.15f) { mSunAngle = -0.15f;            mSunSpeed = fabsf(mSunSpeed); }
+	}
+
 	// DEBUG: camera look + visible terrain
 	XMFLOAT3 look = mCamera.GetLook3f();
 
@@ -487,7 +601,7 @@ void DX12App::OnKeyboardInput(const GameTimer& gt)
 	OutputDebugStringA(buf);
 	auto clamp = [](float v, float a, float b) { return std::max(a, std::min(v, b)); };
 
-	if (GetAsyncKeyState('T') & 0x8000) mAtmoEnabled = !mAtmoEnabled;
+	if (GetAsyncKeyState('T') & 0x0001) mAtmoEnabled = !mAtmoEnabled;
 
 	// Clean preset
 	if (GetAsyncKeyState('C') & 0x8000)
@@ -520,6 +634,19 @@ void DX12App::OnKeyboardInput(const GameTimer& gt)
 
 	if (GetAsyncKeyState('7') & 0x8000) mMieG = clamp(mMieG - 0.002f, 0.60f, 0.95f);
 	if (GetAsyncKeyState('8') & 0x8000) mMieG = clamp(mMieG + 0.002f, 0.60f, 0.95f);
+
+	// --- Sun controls ---
+
+	if (GetAsyncKeyState('R') & 0x0001) mSunAuto = !mSunAuto;
+
+	if (GetAsyncKeyState('I') & 0x8000) mSunAngle += 0.6f * dt; // вверх
+	if (GetAsyncKeyState('K') & 0x8000) mSunAngle -= 0.6f * dt; // вниз
+
+	if (GetAsyncKeyState('J') & 0x8000) mSunAzimuth -= 0.8f * dt;
+	if (GetAsyncKeyState('L') & 0x8000) mSunAzimuth += 0.8f * dt;
+
+	mSunAngle = clamp(mSunAngle, -0.15f, XM_PIDIV2 - 0.05f);
+
 
 
 }
@@ -799,18 +926,18 @@ void DX12App::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
 
-	DirectX::XMFLOAT3 sunDir = { 0.57735f, -0.57735f, 0.57735f };
-	for (auto& L : mAllLights)
-	{
-		if (L->LightType == LightType::Directional)
-		{
-			sunDir = { -L->Direction.x, -L->Direction.y, -L->Direction.z };
-			break;
-		}
-	}
+	DirectX::XMFLOAT3 sunDir;
+	sunDir.y = sinf(mSunAngle);                
+	float h = cosf(mSunAngle);                   
+	sunDir.x = h * cosf(mSunAzimuth);
+	sunDir.z = h * sinf(mSunAzimuth);
+
+	XMVECTOR v = XMVector3Normalize(XMLoadFloat3(&sunDir));
+	XMStoreFloat3(&sunDir, v);
 
 	mMainPassCB.SunDirW = sunDir;
 	mMainPassCB.SunIntensity = 5.0f;
+
 
 	mMainPassCB.BetaRayleigh = DirectX::XMFLOAT3(5.5e-6f, 13.0e-6f, 22.4e-6f);
 	mMainPassCB.BetaMie = DirectX::XMFLOAT3(21e-6f, 21e-6f, 21e-6f);
@@ -834,6 +961,62 @@ void DX12App::UpdateMainPassCB(const GameTimer& gt)
 	auto currPassCB = mCurrFrameResource->PassCB.get();
 	currPassCB->CopyData(0, mMainPassCB);
 }
+
+static float Clamp01(float v) { return (v < 0.f) ? 0.f : (v > 1.f ? 1.f : v); }
+
+void DX12App::UpdateSkyBoxRotation()
+{
+	if (!mSkyRitem) return;
+
+	using namespace DirectX;
+
+	XMVECTOR target = XMVector3Normalize(XMLoadFloat3(&mMainPassCB.SunDirW));
+
+	XMVECTOR ref = XMVector3Normalize(XMLoadFloat3(&mSkySunRefDir));
+
+	XMVECTOR axis = XMVector3Cross(ref, target);
+
+
+	float d;
+	XMStoreFloat(&d, XMVector3Dot(ref, target));
+	d = std::max(-1.0f, std::min(1.0f, d));
+	float angle = acosf(d);
+
+	XMVECTOR axisLen2 = XMVector3Dot(axis, axis);
+	float a2; XMStoreFloat(&a2, axisLen2);
+
+	XMMATRIX Ralign = XMMatrixIdentity();
+
+	if (a2 > 1e-8f)
+	{
+		axis = XMVector3Normalize(axis);
+		Ralign = XMMatrixRotationAxis(axis, angle);
+	}
+	else
+	{
+
+		if (d < -0.999f)
+		{
+			XMVECTOR any = XMVectorSet(0, 1, 0, 0);
+			XMVECTOR altAxis = XMVector3Cross(ref, any);
+			float alt2; XMStoreFloat(&alt2, XMVector3Dot(altAxis, altAxis));
+			if (alt2 < 1e-8f)
+				altAxis = XMVector3Cross(ref, XMVectorSet(1, 0, 0, 0));
+
+			altAxis = XMVector3Normalize(altAxis);
+			Ralign = XMMatrixRotationAxis(altAxis, XM_PI);
+		}
+	}
+
+	XMMATRIX Rroll = XMMatrixRotationAxis(target, mSkyRoll);
+
+	XMMATRIX S = XMMatrixScaling(5000.0f, 5000.0f, 5000.0f);
+
+	XMStoreFloat4x4(&mSkyRitem->World, S * Rroll * Ralign);
+
+	mSkyRitem->NumFramesDirty = gNumFrameResources;
+}
+
 
 
 void DX12App::LoadTexture(std::string name, std::wstring filename, TextureType type)
@@ -1038,7 +1221,7 @@ void DX12App::BuildDescriptorHeaps()
 
 	// copy gbuffer resources into the srv heap
 	auto srvGBuffer = CD3DX12_CPU_DESCRIPTOR_HANDLE(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
-	srvGBuffer.Offset(mGBuffer->Channel0SRVHeapIndex, mCbvSrvUavDescriptorSize);
+	srvGBuffer.Offset(mGBuffer->Channel0SRVHeapIndex, mCbvSrvDescriptorSize);
 	md3dDevice->CopyDescriptorsSimple(mGBuffer->NumBuffers, srvGBuffer,
 		mGBuffer->m_SRVDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1076,6 +1259,7 @@ void DX12App::BuildShadersAndInputLayout()
 	
 	mShaders["postVS"] = d3dUtil::CompileShader(L"Shaders\\PostProcessing.hlsl", nullptr, "VS", "vs_5_0");
 	mShaders["postPS"] = d3dUtil::CompileShader(L"Shaders\\PostProcessing.hlsl", nullptr, "PS", "ps_5_0");
+
 
 	mInputLayout =
 	{
@@ -1547,7 +1731,8 @@ RenderItem* DX12App::BuildRenderItem(std::string name, std::string material, XMM
 
 void DX12App::BuildRenderItems()
 {
-	BuildRenderItem("box", "sky", XMMatrixIdentity(), nullptr, (int) RenderLayer::Sky, 5000.0f);
+	mSkyRitem = BuildRenderItem("box", "sky", XMMatrixIdentity(), nullptr, (int)RenderLayer::Sky, 5000.0f);
+
 
 }
 
@@ -1584,8 +1769,8 @@ void DX12App::BuildLightObjects()
 		mAllLights.at(i)->shadowMap = new ShadowMap(md3dDevice.Get(), 2048, 2048);
 
 		mAllLights.at(i)->shadowMap->BuildDescriptors(
-			CD3DX12_CPU_DESCRIPTOR_HANDLE(srvCpuStart, mShadowMapHeapIndex + i, mCbvSrvUavDescriptorSize),
-			CD3DX12_GPU_DESCRIPTOR_HANDLE(srvGpuStart, mShadowMapHeapIndex + i, mCbvSrvUavDescriptorSize),
+			CD3DX12_CPU_DESCRIPTOR_HANDLE(srvCpuStart, mShadowMapHeapIndex + i, mCbvSrvDescriptorSize),
+			CD3DX12_GPU_DESCRIPTOR_HANDLE(srvGpuStart, mShadowMapHeapIndex + i, mCbvSrvDescriptorSize),
 			CD3DX12_CPU_DESCRIPTOR_HANDLE(dsvCpuStart, 1 + i, mDsvDescriptorSize));
 	}
 }
@@ -1637,6 +1822,13 @@ void DX12App::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const std::vec
 			mCbvSrvDescriptorSize
 		);
 		cmdList->SetGraphicsRootDescriptorTable(4, texHandle4);
+
+		CD3DX12_GPU_DESCRIPTOR_HANDLE paintHandle(
+			mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+			mPaintMaskSrvIndex,
+			mCbvSrvDescriptorSize
+		);
+		cmdList->SetGraphicsRootDescriptorTable(5, paintHandle);
 
 
 		cmdList->IASetVertexBuffers(0, 1, &ri->Geo->VertexBufferView());
@@ -1950,6 +2142,327 @@ void DX12App::ChooseVisibleTerrainTile(Node* node)
 		}
 	}
 }
+
+void DX12App::BuildPaintMask()
+{
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	texDesc.Width = PaintW;
+	texDesc.Height = PaintH;
+	texDesc.DepthOrArraySize = 1;
+	texDesc.MipLevels = 1;
+	texDesc.Format = DXGI_FORMAT_R8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(mPaintMask.GetAddressOf())
+	));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
+		mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+		mPaintMaskSrvIndex,
+		mCbvSrvDescriptorSize
+	);
+	md3dDevice->CreateShaderResourceView(mPaintMask.Get(), &srvDesc, srvHandle);
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	uavDesc.Format = DXGI_FORMAT_R8_UNORM;
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	uavDesc.Texture2D.MipSlice = 0;
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE uavHandle(
+		mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+		mPaintMaskUavIndex,
+		mCbvSrvDescriptorSize
+	);
+	md3dDevice->CreateUnorderedAccessView(mPaintMask.Get(), nullptr, &uavDesc, uavHandle);
+
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mPaintMask.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE uavCpu(
+		mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+		mPaintMaskUavIndex,
+		mCbvSrvDescriptorSize
+	);
+	CD3DX12_GPU_DESCRIPTOR_HANDLE uavGpu(
+		mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+		mPaintMaskUavIndex,
+		mCbvSrvDescriptorSize
+	);
+
+	ID3D12DescriptorHeap* heaps[] = { mSrvDescriptorHeap.Get() };
+	mCommandList->SetDescriptorHeaps(1, heaps);
+
+	UINT clear[4] = { 0,0,0,0 };
+	mCommandList->ClearUnorderedAccessViewUint(uavGpu, uavCpu, mPaintMask.Get(), clear, 0, nullptr);
+
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mPaintMask.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+}
+
+void DX12App::BuildPickBuffer()
+{
+	// StructuredBuffer<float2> : 1 element * 8 bytes
+	UINT64 byteSize = 8;
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(byteSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(mPickBuffer.GetAddressOf())
+	));
+
+	// UAV
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+	uavDesc.Buffer.NumElements = 1;
+	uavDesc.Buffer.StructureByteStride = 8;
+
+	md3dDevice->CreateUnorderedAccessView(
+		mPickBuffer.Get(), nullptr, &uavDesc,
+		CD3DX12_CPU_DESCRIPTOR_HANDLE(
+			mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+			mPickUavIndex, mCbvSrvDescriptorSize)
+	);
+
+	// SRV
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Buffer.NumElements = 1;
+	srvDesc.Buffer.StructureByteStride = 8;
+
+	md3dDevice->CreateShaderResourceView(
+		mPickBuffer.Get(), &srvDesc,
+		CD3DX12_CPU_DESCRIPTOR_HANDLE(
+			mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
+			mPickSrvIndex, mCbvSrvDescriptorSize)
+	);
+}
+
+
+void DX12App::BuildPaintCompute()
+{
+	auto cs = d3dUtil::CompileShader(L"Shaders\\PaintCS.hlsl", nullptr, "main", "cs_5_1");
+
+	CD3DX12_DESCRIPTOR_RANGE srvRange;
+	srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);   // t0
+
+	CD3DX12_DESCRIPTOR_RANGE uavRange;
+	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);   // u0
+
+	CD3DX12_ROOT_PARAMETER params[3];
+	params[0].InitAsConstantBufferView(0);                  // b0
+	params[1].InitAsDescriptorTable(1, &srvRange);          // t0
+	params[2].InitAsDescriptorTable(1, &uavRange);          // u0
+
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
+	rsDesc.Init(3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+	ComPtr<ID3DBlob> blob, err;
+	ThrowIfFailed(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err));
+	ThrowIfFailed(md3dDevice->CreateRootSignature(
+		0, blob->GetBufferPointer(), blob->GetBufferSize(),
+		IID_PPV_ARGS(mPaintRootSig.GetAddressOf())
+	));
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = mPaintRootSig.Get();
+	psoDesc.CS = { reinterpret_cast<BYTE*>(cs->GetBufferPointer()), cs->GetBufferSize() };
+
+	ThrowIfFailed(md3dDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(mPaintPSO.GetAddressOf())));
+}
+
+void DX12App::BuildPickCompute()
+{
+	auto cs = d3dUtil::CompileShader(L"Shaders\\PickCS.hlsl", nullptr, "main", "cs_5_1");
+
+	CD3DX12_DESCRIPTOR_RANGE srvRange;
+	srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
+
+	CD3DX12_DESCRIPTOR_RANGE uavRange;
+	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+
+	CD3DX12_ROOT_PARAMETER params[3];
+	params[0].InitAsConstantBufferView(0);          // b0
+	params[1].InitAsDescriptorTable(1, &srvRange);  // t0
+	params[2].InitAsDescriptorTable(1, &uavRange);  // u0
+
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
+	rsDesc.Init(3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+	ComPtr<ID3DBlob> blob, err;
+	ThrowIfFailed(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err));
+	ThrowIfFailed(md3dDevice->CreateRootSignature(
+		0, blob->GetBufferPointer(), blob->GetBufferSize(),
+		IID_PPV_ARGS(mPickRootSig.GetAddressOf())
+	));
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = mPickRootSig.Get();
+	psoDesc.CS = { (BYTE*)cs->GetBufferPointer(), cs->GetBufferSize() };
+
+	ThrowIfFailed(md3dDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(mPickPSO.GetAddressOf())));
+}
+
+void DX12App::ExecutePaintStrokes()
+{
+	if (mPendingStrokes.empty()) return;
+
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mPaintMask.Get(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+
+	ID3D12DescriptorHeap* heaps[] = { mSrvDescriptorHeap.Get() };
+	mCommandList->SetDescriptorHeaps(1, heaps);
+
+	for (auto& s : mPendingStrokes)
+	{
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+			mPickBuffer.Get(),
+			D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+
+		mCommandList->SetPipelineState(mPickPSO.Get());
+		mCommandList->SetComputeRootSignature(mPickRootSig.Get());
+
+		PickParamsCB pcb;
+		pcb.sx = (UINT)s.sx;
+		pcb.sy = (UINT)s.sy;
+		pcb.ScreenSize = { (float)mClientWidth, (float)mClientHeight };
+		pcb.InvViewProj = mMainPassCB.InvViewProj; 
+		pcb.RootSize = RootSize;
+
+		mPickParamsCB->CopyData(0, pcb);
+		mCommandList->SetComputeRootConstantBufferView(0, mPickParamsCB->Resource()->GetGPUVirtualAddress());
+
+		mCommandList->SetComputeRootDescriptorTable(1,
+			CD3DX12_GPU_DESCRIPTOR_HANDLE(
+				mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+				mGBuffer->Channel0SRVHeapIndex + 1,
+				mCbvSrvDescriptorSize));
+
+		mCommandList->SetComputeRootDescriptorTable(2,
+			CD3DX12_GPU_DESCRIPTOR_HANDLE(
+				mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+				mPickUavIndex,
+				mCbvSrvDescriptorSize));
+
+		mCommandList->Dispatch(1, 1, 1);
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mPickBuffer.Get()));
+
+
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+			mPickBuffer.Get(),
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+
+		mCommandList->SetPipelineState(mPaintPSO.Get());
+		mCommandList->SetComputeRootSignature(mPaintRootSig.Get());
+		float u, v;
+		if (!PickTerrainUV((int)s.sx, (int)s.sy, u, v))
+			continue;
+		PaintParamsCB paintCB = {};
+		paintCB.CenterUV = { u, v };        
+		paintCB.RadiusPx = s.radius;
+		paintCB.Strength = s.strength;
+		paintCB.TexSize = { (float)PaintW, (float)PaintH };
+		mPaintParamsCB->CopyData(0, paintCB);
+
+		mCommandList->SetComputeRootConstantBufferView(0, mPaintParamsCB->Resource()->GetGPUVirtualAddress());
+
+		mCommandList->SetComputeRootDescriptorTable(1,
+			CD3DX12_GPU_DESCRIPTOR_HANDLE(
+				mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+				mPickSrvIndex,
+				mCbvSrvDescriptorSize));
+
+		mCommandList->SetComputeRootDescriptorTable(2,
+			CD3DX12_GPU_DESCRIPTOR_HANDLE(
+				mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+				mPaintMaskUavIndex,
+				mCbvSrvDescriptorSize));
+
+		UINT groupsX = (PaintW + 7) / 8;
+		UINT groupsY = (PaintH + 7) / 8;
+		mCommandList->Dispatch(groupsX, groupsY, 1);
+
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+			mPickBuffer.Get(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON));
+	}
+
+	mPendingStrokes.clear();
+
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		mPaintMask.Get(),
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+}
+
+
+bool DX12App::PickTerrainUV(int sx, int sy, float& outU, float& outV)
+{
+	XMMATRIX view = mCamera.GetView();
+	XMMATRIX proj = mCamera.GetProj();
+	XMMATRIX world = XMMatrixIdentity();
+
+	XMVECTOR nearP = XMVector3Unproject(
+		XMVectorSet((float)sx, (float)sy, 0.0f, 1.0f),
+		mScreenViewport.TopLeftX, mScreenViewport.TopLeftY,
+		mScreenViewport.Width, mScreenViewport.Height,
+		mScreenViewport.MinDepth, mScreenViewport.MaxDepth,
+		proj, view, world);
+
+	XMVECTOR farP = XMVector3Unproject(
+		XMVectorSet((float)sx, (float)sy, 1.0f, 1.0f),
+		mScreenViewport.TopLeftX, mScreenViewport.TopLeftY,
+		mScreenViewport.Width, mScreenViewport.Height,
+		mScreenViewport.MinDepth, mScreenViewport.MaxDepth,
+		proj, view, world);
+
+	XMVECTOR dir = XMVector3Normalize(farP - nearP);
+	XMVECTOR origin = nearP;
+
+	float planeY = -40.0f;
+	float oy = XMVectorGetY(origin);
+	float dy = XMVectorGetY(dir);
+	if (fabsf(dy) < 1e-6f) return false;
+
+	float t = (planeY - oy) / dy;
+	if (t < 0.0f) return false;
+
+	XMVECTOR hit = origin + t * dir;
+	float hx = XMVectorGetX(hit);
+	float hz = XMVectorGetZ(hit);
+
+	outU = (hx / RootSize) + 0.5f;
+	outV = (hz / RootSize) + 0.5f;
+	outV = 1.0f - outV;
+
+	return (outU >= 0.0f && outU <= 1.0f && outV >= 0.0f && outV <= 1.0f);
+}
+
 
 std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> DX12App::GetStaticSamplers()
 {
