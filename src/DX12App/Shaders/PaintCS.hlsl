@@ -1,12 +1,13 @@
 cbuffer PaintParams : register(b0)
 {
+    float2 gCenterUV;
     float gRadiusPx;
     float gStrength;
+
     float2 gTexSize;
-    float _pad0;
+    float _pad0, _pad1;
 };
 
-StructuredBuffer<float2> gPickIn : register(t0); 
 RWTexture2D<float> gMask : register(u0);
 
 [numthreads(8, 8, 1)]
@@ -15,12 +16,8 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= (uint) gTexSize.x || tid.y >= (uint) gTexSize.y)
         return;
 
-    float2 centerUV = gPickIn[0];
-    if (centerUV.x < 0.0f)
-        return;
-
     float2 p = float2(tid.x + 0.5, tid.y + 0.5);
-    float2 c = centerUV * gTexSize;
+    float2 c = gCenterUV * gTexSize;
 
     float d = distance(p, c);
     if (d > gRadiusPx)
