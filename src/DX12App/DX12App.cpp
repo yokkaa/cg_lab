@@ -156,8 +156,17 @@ private:
 	void BuildPaintCompute();
 	void ExecutePaintStrokes();
 	bool PickTerrainUV(int sx, int sy, float& outU, float& outV);
+
 	void DrawShadowMaps();
 	void UpdateSkyBoxRotation();
+
+	static bool RayTriangleIntersect(
+		const DirectX::XMVECTOR& rayOrigin,
+		const DirectX::XMVECTOR& rayDir,
+		const DirectX::XMVECTOR& v0,
+		const DirectX::XMVECTOR& v1,
+		const DirectX::XMVECTOR& v2,
+		float& t, float& u, float& v);
 
 
 	// Quad Tree for Terrain
@@ -214,6 +223,9 @@ private:
 	float RootSize = 1024.f;
 	float thresholds[5] = {1500.f, 1000.f, 500.f, 200.f, 100.f};
 
+
+
+
 	// Atmosphere controls
 	float mAtmoDensity = 1.0f;
 	float mMieG = 0.80f;
@@ -228,7 +240,6 @@ private:
 	bool  mSunAuto = false;    
 	float mSunSpeed = 0.15f;     
 
-	// --- Paint mask (GPU) ---
 	static const UINT PaintW = 1024;
 	static const UINT PaintH = 1024;
 
@@ -2271,45 +2282,115 @@ void DX12App::ExecutePaintStrokes()
 }
 
 
+bool DX12App::RayTriangleIntersect(
+	const XMVECTOR& rayOrigin,
+	const XMVECTOR& rayDir,
+	const XMVECTOR& v0,
+	const XMVECTOR& v1,
+	const XMVECTOR& v2,
+	float& t, float& u, float& v)
+{
+	// Möller–Trumbore
+	const float EPS = 1e-6f;
+
+	XMVECTOR e1 = v1 - v0;
+	XMVECTOR e2 = v2 - v0;
+
+	XMVECTOR p = XMVector3Cross(rayDir, e2);
+	float det = XMVectorGetX(XMVector3Dot(e1, p));
+	if (fabsf(det) < EPS) return false;
+
+	float invDet = 1.0f / det;
+	XMVECTOR s = rayOrigin - v0;
+
+	u = XMVectorGetX(XMVector3Dot(s, p)) * invDet;
+	if (u < 0.0f || u > 1.0f) return false;
+
+	XMVECTOR q = XMVector3Cross(s, e1);
+
+	v = XMVectorGetX(XMVector3Dot(rayDir, q)) * invDet;
+	if (v < 0.0f || (u + v) > 1.0f) return false;
+
+	t = XMVectorGetX(XMVector3Dot(e2, q)) * invDet;
+	return t > EPS;
+}
 
 
 bool DX12App::PickTerrainUV(int sx, int sy, float& outU, float& outV)
 {
 	XMMATRIX view = mCamera.GetView();
 	XMMATRIX proj = mCamera.GetProj();
-	XMMATRIX world = XMMatrixIdentity();
+	XMMATRIX worldI = XMMatrixIdentity();
 
 	XMVECTOR nearP = XMVector3Unproject(
 		XMVectorSet((float)sx, (float)sy, 0.0f, 1.0f),
 		mScreenViewport.TopLeftX, mScreenViewport.TopLeftY,
 		mScreenViewport.Width, mScreenViewport.Height,
 		mScreenViewport.MinDepth, mScreenViewport.MaxDepth,
-		proj, view, world);
+		proj, view, worldI);
 
 	XMVECTOR farP = XMVector3Unproject(
 		XMVectorSet((float)sx, (float)sy, 1.0f, 1.0f),
 		mScreenViewport.TopLeftX, mScreenViewport.TopLeftY,
 		mScreenViewport.Width, mScreenViewport.Height,
 		mScreenViewport.MinDepth, mScreenViewport.MaxDepth,
-		proj, view, world);
+		proj, view, worldI);
 
-	XMVECTOR dir = XMVector3Normalize(farP - nearP);
-	XMVECTOR origin = nearP;
+	XMVECTOR rayOrigin = nearP;
+	XMVECTOR rayDir = XMVector3Normalize(farP - nearP);
 
-	float planeY = -40.0f;
-	float oy = XMVectorGetY(origin);
-	float dy = XMVectorGetY(dir);
-	if (fabsf(dy) < 1e-6f) return false;
+	auto geo = mGeometries["shapeGeo"].get();
+	auto& grid = geo->DrawArgs["grid"];
 
-	float t = (planeY - oy) / dy;
-	if (t < 0.0f) return false;
+	Vertex* verts = (Vertex*)geo->VertexBufferCPU->GetBufferPointer();
+	uint16_t* inds = (uint16_t*)geo->IndexBufferCPU->GetBufferPointer();
 
-	XMVECTOR hit = origin + t * dir;
-	float hx = XMVectorGetX(hit);
-	float hz = XMVectorGetZ(hit);
+	float bestT = FLT_MAX;
+	bool hit = false;
+	float bestU = 0.0f, bestV = 0.0f;
 
-	outU = (hx / RootSize) + 0.5f;
-	outV = (hz / RootSize) + 0.5f;
+	for (auto* ri : mVisibleTerrain)
+	{
+		XMMATRIX W = XMLoadFloat4x4(&ri->World);
+
+		for (UINT i = 0; i < grid.IndexCount; i += 3)
+		{
+			uint16_t i0 = inds[grid.StartIndexLocation + i + 0] + grid.BaseVertexLocation;
+			uint16_t i1 = inds[grid.StartIndexLocation + i + 1] + grid.BaseVertexLocation;
+			uint16_t i2 = inds[grid.StartIndexLocation + i + 2] + grid.BaseVertexLocation;
+
+			XMVECTOR p0 = XMVector3TransformCoord(XMLoadFloat3(&verts[i0].Pos), W);
+			XMVECTOR p1 = XMVector3TransformCoord(XMLoadFloat3(&verts[i1].Pos), W);
+			XMVECTOR p2 = XMVector3TransformCoord(XMLoadFloat3(&verts[i2].Pos), W);
+
+			float t, u, v;
+			if (!RayTriangleIntersect(rayOrigin, rayDir, p0, p1, p2, t, u, v))
+				continue;
+
+			if (t < bestT)
+			{
+				bestT = t;
+				hit = true;
+
+				XMFLOAT2 uv0 = verts[i0].TexC;
+				XMFLOAT2 uv1 = verts[i1].TexC;
+				XMFLOAT2 uv2 = verts[i2].TexC;
+
+				float w = 1.0f - u - v;
+				float localU = uv0.x * w + uv1.x * u + uv2.x * v;
+				float localV = uv0.y * w + uv1.y * u + uv2.y * v;
+
+				XMVECTOR hitPos = rayOrigin + rayDir * bestT;
+				float hx = XMVectorGetX(hitPos);
+				float hz = XMVectorGetZ(hitPos);
+
+				outU = (hx / RootSize) + 0.5f;
+				outV = (hz / RootSize) + 0.5f;
+			}
+		}
+	}
+
+	if (!hit) return false;
 
 	return (outU >= 0.0f && outU <= 1.0f && outV >= 0.0f && outV <= 1.0f);
 }
