@@ -95,14 +95,19 @@ struct LightObject
 
 struct PaintParamsCB
 {
-	DirectX::XMFLOAT2 CenterUV = { -1.0f, -1.0f }; 
-	float RadiusPx = 20.0f;                     
-	float Strength = 0.35f;                      
+	DirectX::XMFLOAT2 ScreenPx = { -1, -1 };
+	DirectX::XMFLOAT2 ViewportSize = { 1, 1 };
 
-	DirectX::XMFLOAT2 TexSize = { 1024.0f, 1024.0f }; 
-	float pad0 = 0.0f;
-	float pad1 = 0.0f;
+	DirectX::XMFLOAT2 TexSize = { 1024, 1024 };
+	float RootSize = 1024.0f;
+	float RadiusPx = 30.0f;
+
+	float Strength = 0.35f;
+	float pad0[3] = { 0,0,0 };
+
+	DirectX::XMFLOAT4X4 InvViewProj = MathHelper::Identity4x4();
 };
+
 
 
 class DX12App : public D3DApp
@@ -196,6 +201,8 @@ private:
 	std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> mPSOs;
 
 	std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
+	ComPtr<ID3D12DescriptorHeap> mPaintClearHeap = nullptr;
+
 
 	// List of all the render items.
 	std::vector<std::unique_ptr<RenderItem>> mAllRitems;
@@ -2172,6 +2179,16 @@ void DX12App::BuildPaintMask()
 	);
 	md3dDevice->CreateUnorderedAccessView(mPaintMask.Get(), nullptr, &uavDesc, uavHandle);
 
+	D3D12_DESCRIPTOR_HEAP_DESC clearHeapDesc = {};
+	clearHeapDesc.NumDescriptors = 1;
+	clearHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	clearHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&clearHeapDesc, IID_PPV_ARGS(&mPaintClearHeap)));
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE clearUavCpu(mPaintClearHeap->GetCPUDescriptorHandleForHeapStart());
+	md3dDevice->CreateUnorderedAccessView(mPaintMask.Get(), nullptr, &uavDesc, clearUavCpu);
+
+
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
 		mPaintMask.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
 
@@ -2202,14 +2219,19 @@ void DX12App::BuildPaintCompute()
 	auto cs = d3dUtil::CompileShader(L"Shaders\\PaintCS.hlsl", nullptr, "main", "cs_5_1");
 
 	CD3DX12_DESCRIPTOR_RANGE uavRange;
-	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); 
 
-	CD3DX12_ROOT_PARAMETER params[2];
-	params[0].InitAsConstantBufferView(0);          // b0
-	params[1].InitAsDescriptorTable(1, &uavRange);  // u0
+	CD3DX12_DESCRIPTOR_RANGE srvRange;
+	srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); 
+
+	CD3DX12_ROOT_PARAMETER params[3];
+	params[0].InitAsConstantBufferView(0);          
+	params[1].InitAsDescriptorTable(1, &uavRange);  
+	params[2].InitAsDescriptorTable(1, &srvRange);  
 
 	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
-	rsDesc.Init(2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+	rsDesc.Init(3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
 
 	ComPtr<ID3DBlob> blob, err;
 	ThrowIfFailed(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err));
@@ -2243,34 +2265,48 @@ void DX12App::ExecutePaintStrokes()
 
 	for (auto& s : mPendingStrokes)
 	{
-		float u, v;
-		if (!PickTerrainUV((int)s.sx, (int)s.sy, u, v))
-			continue;
+		for (auto& s : mPendingStrokes)
+		{
+			PaintParamsCB paintCB = {};
 
-		PaintParamsCB paintCB = {};
-		paintCB.CenterUV = { u, v };
-		paintCB.RadiusPx = s.radius;
-		paintCB.Strength = s.strength;
-		paintCB.TexSize = { (float)PaintW, (float)PaintH };
+			paintCB.ScreenPx = { (float)s.sx, (float)s.sy };
+			paintCB.ViewportSize = { (float)mClientWidth, (float)mClientHeight };
 
-		mPaintParamsCB->CopyData(0, paintCB);
+			paintCB.TexSize = { (float)PaintW, (float)PaintH };
+			paintCB.RootSize = RootSize;
 
-	
-		mCommandList->SetComputeRootConstantBufferView(
-			0, mPaintParamsCB->Resource()->GetGPUVirtualAddress());
+			paintCB.RadiusPx = s.radius;
+			paintCB.Strength = s.strength;
 
-		mCommandList->SetComputeRootDescriptorTable(
-			1,
-			CD3DX12_GPU_DESCRIPTOR_HANDLE(
-				mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
-				mPaintMaskUavIndex,
-				mCbvSrvDescriptorSize));
+			paintCB.InvViewProj = mMainPassCB.InvViewProj;
 
-		UINT groupsX = (PaintW + 7) / 8;
-		UINT groupsY = (PaintH + 7) / 8;
-		mCommandList->Dispatch(groupsX, groupsY, 1);
+			mPaintParamsCB->CopyData(0, paintCB);
 
-		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mPaintMask.Get()));
+			mCommandList->SetComputeRootConstantBufferView(
+				0, mPaintParamsCB->Resource()->GetGPUVirtualAddress());
+
+			mCommandList->SetComputeRootDescriptorTable(
+				1,
+				CD3DX12_GPU_DESCRIPTOR_HANDLE(
+					mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+					mPaintMaskUavIndex,
+					mCbvSrvDescriptorSize));
+
+			// t0 = gZW (твоя RT1 из GBuffer, где alpha = depth)
+			mCommandList->SetComputeRootDescriptorTable(
+				2,
+				CD3DX12_GPU_DESCRIPTOR_HANDLE(
+					mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart(),
+					mGBuffer->Channel0SRVHeapIndex + 1,
+					mCbvSrvDescriptorSize));
+
+			UINT groupsX = (PaintW + 7) / 8;
+			UINT groupsY = (PaintH + 7) / 8;
+			mCommandList->Dispatch(groupsX, groupsY, 1);
+
+			mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mPaintMask.Get()));
+		}
+
 	}
 
 	mPendingStrokes.clear();

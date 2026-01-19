@@ -277,7 +277,6 @@ GBufferData DeferredPS(VertexOut pin)
     float2 paintUV = float2(pin.PosW.x / gTerrainRootSize + 0.5f,
                         pin.PosW.z / gTerrainRootSize + 0.5f);
     
-    paintUV.y = 1.0f - paintUV.y;
 
     paintUV = saturate(paintUV);
 
