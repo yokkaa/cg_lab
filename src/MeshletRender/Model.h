@@ -12,6 +12,9 @@
 
 #include "Span.h"
 
+#include <string>
+#include <cstdint>
+
 #include <DirectXCollision.h>
 
 struct Attribute
@@ -101,8 +104,8 @@ struct Mesh
     Microsoft::WRL::ComPtr<ID3D12Resource>              MeshInfoResource;
 
     // Calculates the number of instances of the last meshlet which can be packed into a single threadgroup.
-    uint32_t GetLastMeshletPackCount(uint32_t subsetIndex, uint32_t maxGroupVerts, uint32_t maxGroupPrims) 
-    { 
+    uint32_t GetLastMeshletPackCount(uint32_t subsetIndex, uint32_t maxGroupVerts, uint32_t maxGroupPrims)
+    {
         if (Meshlets.size() == 0)
             return 0;
 
@@ -127,7 +130,7 @@ struct Mesh
         {
             return *reinterpret_cast<const uint32_t*>(addr);
         }
-        else 
+        else
         {
             return *reinterpret_cast<const uint16_t*>(addr);
         }
@@ -138,6 +141,7 @@ class Model
 {
 public:
     HRESULT LoadFromFile(const wchar_t* filename);
+    HRESULT LoadFromFileDirectStorage(ID3D12Device* device, const wchar_t* filename);
     HRESULT UploadGpuResources(ID3D12Device* device, ID3D12CommandQueue* cmdQueue, ID3D12CommandAllocator* cmdAlloc, ID3D12GraphicsCommandList* cmdList);
 
     uint32_t GetMeshCount() const { return static_cast<uint32_t>(m_meshes.size()); }
@@ -150,8 +154,12 @@ public:
     auto end() { return m_meshes.end(); }
 
 private:
-    std::vector<Mesh>                      m_meshes;
-    DirectX::BoundingSphere                m_boundingSphere;
+    std::vector<Mesh>       m_meshes;
+    DirectX::BoundingSphere m_boundingSphere;
 
-    std::vector<uint8_t>                   m_buffer;
+    std::vector<uint8_t>    m_buffer;
+
+    // для DirectStorage:
+    std::wstring            m_sourceFile;     // абсолютный путь к .bin
+    uint64_t                m_blobFileOffset; // смещение в файле до начала m_buffer
 };

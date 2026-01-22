@@ -1,0 +1,20 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Build outputs
+**/bin/
+**/obj/
+x64/
+x86/
+Debug/
+Release/
+**/Debug/
+**/Release/
+
+# Optional: NuGet / packages (если генерятся локально)
+packages/
+**/packages/

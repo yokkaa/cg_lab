@@ -72,7 +72,7 @@ private:
     StepTimer m_timer;
     SimpleCamera m_camera;
     Model m_model;
-    
+
     // Synchronization objects.
     UINT m_frameIndex;
     UINT m_frameCounter;
