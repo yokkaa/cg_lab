@@ -276,7 +276,7 @@ void D3D12MeshletRender::LoadAssets()
     // to record yet. The main loop expects it to be closed, so close it now.
     ThrowIfFailed(m_commandList->Close());
 
-    m_model.LoadFromFile(c_meshFilename);
+    ThrowIfFailed(m_model.LoadFromFileDirectStorage(m_device.Get(), c_meshFilename));
     m_model.UploadGpuResources(m_device.Get(), m_commandQueue.Get(), m_commandAllocators[m_frameIndex].Get(), m_commandList.Get());
 
 #ifdef _DEBUG

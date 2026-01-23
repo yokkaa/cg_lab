@@ -126,7 +126,6 @@ namespace
         std::wstring abs;
         abs.resize(needed);
 
-        // NOTE: In older C++ modes wstring::data() returns const wchar_t*, so we must use &abs[0].
         DWORD written = GetFullPathNameW(path, needed, &abs[0], nullptr);
         if (written == 0)
             return std::wstring(path);
